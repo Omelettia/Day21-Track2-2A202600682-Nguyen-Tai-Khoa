@@ -25,6 +25,8 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Run unit tests
+        env:
+          MLFLOW_TRACKING_URI: file:///tmp/mlruns
         run: python -m pytest tests/ -v
 
   train:
@@ -55,6 +57,8 @@ jobs:
         run: dvc pull data/train_phase1.csv.dvc data/eval.csv.dvc
 
       - name: Train model
+        env:
+          MLFLOW_TRACKING_URI: file:///tmp/mlruns
         run: python src/train.py
 
       - name: Read metrics
@@ -75,11 +79,13 @@ jobs:
           print(f"Uploaded to s3://{bucket}/models/latest/model.pkl")
           EOF
 
-      - name: Save metrics as artifact
+      - name: Save metrics and report as artifact
         uses: actions/upload-artifact@v4
         with:
           name: metrics
-          path: outputs/metrics.json
+          path: |
+            outputs/metrics.json
+            outputs/report.txt
 
   eval:
     name: Eval
@@ -89,11 +95,43 @@ jobs:
 
       - name: Check eval gate
         run: |
-          python - <<'EOF'
+          python3 - <<'EOF'
           acc = float("${{ needs.train.outputs.accuracy }}")
           if acc < 0.70:
               raise SystemExit(f"FAILED: accuracy {acc:.4f} < 0.70. Cancelling deploy.")
           print(f"PASSED: accuracy {acc:.4f} >= 0.70. Proceeding to deploy.")
+          EOF
+
+      - name: Authenticate to AWS
+        run: |
+          echo '${{ secrets.CLOUD_CREDENTIALS }}' > /tmp/aws-creds.json
+          echo "AWS_ACCESS_KEY_ID=$(python3 -c "import json; print(json.load(open('/tmp/aws-creds.json'))['aws_access_key_id'])")" >> $GITHUB_ENV
+          echo "AWS_SECRET_ACCESS_KEY=$(python3 -c "import json; print(json.load(open('/tmp/aws-creds.json'))['aws_secret_access_key'])")" >> $GITHUB_ENV
+          echo "AWS_DEFAULT_REGION=ap-southeast-1" >> $GITHUB_ENV
+
+      - name: Check rollback gate
+        env:
+          CLOUD_BUCKET: ${{ secrets.CLOUD_BUCKET }}
+        run: |
+          python3 - <<'EOF'
+          import subprocess, json, os, sys
+
+          new_acc = float("${{ needs.train.outputs.accuracy }}")
+          bucket = os.environ["CLOUD_BUCKET"]
+
+          result = subprocess.run(
+              ["aws", "s3", "cp", f"s3://{bucket}/metrics/latest/metrics.json", "/tmp/prev_metrics.json"],
+              capture_output=True,
+          )
+          if result.returncode == 0:
+              with open("/tmp/prev_metrics.json") as f:
+                  prev_acc = json.load(f)["accuracy"]
+              print(f"Previous accuracy: {prev_acc:.4f} | New accuracy: {new_acc:.4f}")
+              if new_acc < prev_acc:
+                  raise SystemExit(f"ROLLBACK: new accuracy {new_acc:.4f} < previous {prev_acc:.4f}. Aborting deploy.")
+              print(f"APPROVED: new model ({new_acc:.4f}) >= previous ({prev_acc:.4f}). Deploying.")
+          else:
+              print("No previous baseline found on S3. Skipping rollback check.")
           EOF
 
   deploy:
@@ -101,6 +139,19 @@ jobs:
     needs: eval
     runs-on: ubuntu-latest
     steps:
+
+      - name: Download metrics artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: metrics
+          path: outputs/
+
+      - name: Authenticate to AWS
+        run: |
+          echo '${{ secrets.CLOUD_CREDENTIALS }}' > /tmp/aws-creds.json
+          echo "AWS_ACCESS_KEY_ID=$(python3 -c "import json; print(json.load(open('/tmp/aws-creds.json'))['aws_access_key_id'])")" >> $GITHUB_ENV
+          echo "AWS_SECRET_ACCESS_KEY=$(python3 -c "import json; print(json.load(open('/tmp/aws-creds.json'))['aws_secret_access_key'])")" >> $GITHUB_ENV
+          echo "AWS_DEFAULT_REGION=ap-southeast-1" >> $GITHUB_ENV
 
       - name: SSH deploy to VM
         uses: appleboy/ssh-action@v1.0.3
@@ -122,3 +173,10 @@ jobs:
             sudo systemctl status mlops-serve
             sudo journalctl -u mlops-serve -n 50
             exit 1
+
+      - name: Save metrics as new baseline
+        env:
+          CLOUD_BUCKET: ${{ secrets.CLOUD_BUCKET }}
+        run: |
+          aws s3 cp outputs/metrics.json "s3://$CLOUD_BUCKET/metrics/latest/metrics.json"
+          echo "Baseline updated: s3://$CLOUD_BUCKET/metrics/latest/metrics.json"
